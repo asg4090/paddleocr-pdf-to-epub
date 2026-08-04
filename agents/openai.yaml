@@ -1,0 +1,4 @@
+interface:
+  display_name: "PaddleOCR PDF 转 EPUB"
+  short_description: "将 PDF 或 PaddleOCR JSON 转成经校验的 EPUB"
+  default_prompt: "Use $paddleocr-pdf-to-epub to obtain OCR JSON when needed and build this PDF as a validated EPUB."

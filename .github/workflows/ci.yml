@@ -1,0 +1,33 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - name: Install dependencies
+        run: python -m pip install -r requirements.txt
+      - name: Install EPUBCheck
+        run: |
+          curl -fsSL https://github.com/w3c/epubcheck/releases/download/v5.3.0/epubcheck-5.3.0.zip -o /tmp/epubcheck.zip
+          unzip -q /tmp/epubcheck.zip -d /tmp
+          echo "EPUBCHECK_JAR=/tmp/epubcheck-5.3.0/epubcheck.jar" >> "$GITHUB_ENV"
+      - name: Check runtime
+        run: python scripts/doctor.py
+      - name: Run offline end-to-end test
+        run: python scripts/smoke_test.py
