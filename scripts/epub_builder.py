@@ -254,14 +254,137 @@ def ocr_outline(pages: list[dict[str, Any]]) -> list[TocEntry]:
     return candidates
 
 
-def choose_outline(pdf_path: Path, pages: list[dict[str, Any]]) -> tuple[list[TocEntry], str]:
-    existing = pdf_outline(pdf_path, len(pages))
-    if len({entry.page for entry in existing}) >= 3:
-        return existing, "pdf-outline"
-    inferred = ocr_outline(pages)
-    if inferred:
-        return inferred, "ocr-headings"
-    return [], "generated-sections"
+def choose_outline(
+    pdf_path: Path, pages: list[dict[str, Any]]
+) -> tuple[list[TocEntry], str, dict[str, Any]]:
+    """Pick the table of contents, repairing a misaligned PDF outline.
+
+    A PDF outline is only trusted after cross-checking it against the headings
+    actually found in the OCR text.  Bookmarks are frequently authored with
+    printed page numbers (ignoring front matter) or simply point at the wrong
+    pages; without validation the generated EPUB navigation links chapters to
+    the wrong locations.  When the bookmark titles line up with OCR headings
+    at a shifted page, the systematic offset is corrected.  When too few
+    entries can be verified, the OCR-inferred headings are used instead.
+    """
+
+    page_count = len(pages)
+    pdf_entries = pdf_outline(pdf_path, page_count)
+    ocr_entries = ocr_outline(pages)
+    detail: dict[str, Any] = {"page_offset": 0, "verified": 0, "total": 0}
+    if len({entry.page for entry in pdf_entries}) >= 3:
+        index = _heading_index(ocr_entries)
+        offset = _best_page_offset(pdf_entries, index, page_count)
+        shifted = [
+            TocEntry(entry.level, entry.title, min(page_count, max(1, entry.page + offset)))
+            for entry in pdf_entries
+        ]
+        presnap_verified = sum(1 for entry in shifted if _entry_matches(entry, index, entry.page))
+        ratio = presnap_verified / max(1, len(shifted))
+        if not ocr_entries or len(ocr_entries) < 3 or ratio >= 0.5:
+            realigned = [_snap_to_heading(entry, index) for entry in shifted]
+            realigned.sort(key=lambda entry: (entry.page, entry.level))
+            verified = sum(1 for entry in realigned if _entry_matches(entry, index, entry.page))
+            detail = {"page_offset": offset, "verified": verified, "total": len(realigned)}
+            return realigned, "pdf-outline", detail
+    if ocr_entries:
+        return ocr_entries, "ocr-headings", detail
+    if pdf_entries:
+        fallback = sorted(pdf_entries, key=lambda entry: (entry.page, entry.level))
+        return fallback, "pdf-outline", detail
+    return [], "generated-sections", detail
+
+
+def _normalize_title(value: str) -> str:
+    return re.sub(r"\s+", "", clean_text(value)).casefold()
+
+
+def _titles_match(wanted: str, candidate: str) -> bool:
+    if not wanted or not candidate:
+        return False
+    if wanted == candidate:
+        return True
+    short, long = (wanted, candidate) if len(wanted) <= len(candidate) else (candidate, wanted)
+    return len(short) >= 3 and short in long
+
+
+def _heading_index(entries: list[TocEntry]) -> dict[int, set[str]]:
+    index: dict[int, set[str]] = defaultdict(set)
+    for entry in entries:
+        index[entry.page].add(_normalize_title(entry.title))
+    return index
+
+
+def _entry_matches(
+    entry: TocEntry, index: dict[int, set[str]], page: int, *, window: int = 1
+) -> bool:
+    if page < 1:
+        return False
+    wanted = _normalize_title(entry.title)
+    for candidate_page in range(page - window, page + window + 1):
+        for candidate in index.get(candidate_page, ()):
+            if _titles_match(wanted, candidate):
+                return True
+    return False
+
+
+def _snap_to_heading(entry: TocEntry, index: dict[int, set[str]]) -> TocEntry:
+    """Move a bookmark to the nearest page whose OCR heading matches its title.
+
+    Repairs individual entries that a systematic page offset cannot explain,
+    such as subsections sharing their chapter's printed page number.  Exact
+    title matches are trusted over a wider window than loose containment
+    matches; the closest candidate always wins.
+    """
+
+    wanted = _normalize_title(entry.title)
+
+    def nearest(exact_only: bool, window: int) -> int | None:
+        best: int | None = None
+        for page in range(entry.page - window, entry.page + window + 1):
+            if page < 1:
+                continue
+            for candidate in index.get(page, ()):
+                matched = (wanted == candidate) if exact_only else _titles_match(wanted, candidate)
+                if matched:
+                    if best is None or abs(page - entry.page) < abs(best - entry.page):
+                        best = page
+        return best
+
+    target = nearest(True, 8) or nearest(False, 3)
+    if target is not None and target != entry.page:
+        return TocEntry(entry.level, entry.title, target)
+    return entry
+
+
+def _best_page_offset(
+    entries: list[TocEntry],
+    index: dict[int, set[str]],
+    page_count: int,
+    *,
+    max_offset: int = 10,
+) -> int:
+    """Find the systematic page shift that best aligns bookmarks with headings."""
+
+    def score(offset: int) -> int:
+        total = 0
+        for entry in entries:
+            page = entry.page + offset
+            if 1 <= page <= page_count and _entry_matches(entry, index, page, window=0):
+                total += 1
+        return total
+
+    baseline = score(0)
+    best, best_score = 0, baseline
+    for offset in range(-max_offset, max_offset + 1):
+        if offset == 0:
+            continue
+        candidate = score(offset)
+        if candidate > best_score or (candidate == best_score and abs(offset) < abs(best)):
+            best, best_score = offset, candidate
+    if best != 0 and best_score > baseline and best_score >= 2:
+        return best
+    return 0
 
 
 def build_toc_tree(entries: list[TocEntry]) -> list[TocEntry]:
@@ -998,7 +1121,7 @@ def build_epub(
         publisher=publisher,
         identifier=identifier,
     )
-    entries, toc_source = choose_outline(pdf_path, pages)
+    entries, toc_source, toc_detail = choose_outline(pdf_path, pages)
     sections = make_sections(entries, len(pages), max_pages=max(1, max_pages_per_section))
     work_dir.mkdir(parents=True, exist_ok=True)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1086,6 +1209,8 @@ def build_epub(
             "sections": len(sections),
             "toc_entries": len(entries),
             "toc_source": toc_source,
+            "toc_page_offset": toc_detail["page_offset"],
+            "toc_entries_verified": f"{toc_detail['verified']}/{toc_detail['total']}",
             "images": image_stats,
             "math": {
                 "display": totals["display_math"],
